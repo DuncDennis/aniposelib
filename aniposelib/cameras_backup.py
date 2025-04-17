@@ -350,7 +350,7 @@ class Camera:
         self.set_size(new_size)
         self.set_camera_matrix(new_matrix)
 
-    def get_params_old(self, only_extrinsics=False):
+    def get_params(self, only_extrinsics=False):
         if only_extrinsics:
             params = np.zeros(6, dtype="float64")
         else:
@@ -365,34 +365,8 @@ class Camera:
         if self.extra_dist:
             params[8] = dist[1]
         return params
-    
-    def get_params(self, optimize_intrinsics=False):
-        """
-        Return this camera's parameters as a 1D array.
-        If optimize_intrinsics=False, we only return 6 extrinsics.
-        If True, we return 16: extrinsics (6) + intrinsics (5) + distortion (5).
-        """
-        # Extrinsics
-        out = np.zeros(6, dtype=np.float64)
-        out[:3] = self.rvec
-        out[3:6] = self.tvec
 
-        if not optimize_intrinsics:
-            return out
-
-        # Intrinsics: fx, fy, cx, cy, skew
-        # Distortion: k1, k2, p1, p2, k3
-        intr_dist = np.zeros(10, dtype=np.float64)
-        intr_dist[0] = self.matrix[0, 0]  # fx
-        intr_dist[1] = self.matrix[1, 1]  # fy
-        intr_dist[2] = self.matrix[0, 2]  # cx
-        intr_dist[3] = self.matrix[1, 2]  # cy
-        intr_dist[4] = self.matrix[0, 1]  # skew
-        intr_dist[5:10] = self.dist[:5]   # k1, k2, p1, p2, k3
-
-        return np.concatenate([out, intr_dist])
-
-    def set_params_old(self, params, only_extrinsics=False):
+    def set_params(self, params, only_extrinsics=False):
         self.set_rotation(params[0:3])
         self.set_translation(params[3:6])
         if only_extrinsics:
@@ -405,36 +379,6 @@ class Camera:
         if self.extra_dist:
             dist[1] = params[8]
         self.set_distortions(dist)
-    
-    def set_params(self, params, optimize_intrinsics=False):
-        """
-        Set camera parameters from a 1D array of floats.
-        If optimize_intrinsics=False, parse the first 6 as extrinsics.
-        If True, parse extrinsics(6) + intr+dist(10) = 16.
-        """
-        self.rvec = params[:3].copy()
-        self.tvec = params[3:6].copy()
-
-        if not optimize_intrinsics:
-            return
-
-        # intrinsics + distortion
-        fx = params[6]
-        fy = params[7]
-        cx = params[8]
-        cy = params[9]
-        skew = params[10]
-        k1, k2, p1, p2, k3 = params[11:16]
-
-        # Rebuild self.matrix
-        self.matrix = np.array([
-            [fx,   skew, cx],
-            [0.0,   fy,  cy],
-            [0.0, 0.0,  1.0]
-        ], dtype=np.float64)
-
-        # Update distortion
-        self.dist = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
 
     def distort_points(self, points):
         shape = points.shape
@@ -457,7 +401,7 @@ class Camera:
         )
         return out.reshape(shape)
 
-    def project_old(self, points):
+    def project(self, points):
         points = points.reshape(-1, 1, 3)
         out, _ = cv2.projectPoints(
             points,
@@ -467,26 +411,6 @@ class Camera:
             self.dist.astype("float64"),
         )
         return out
-    
-    def project(self, points_3d):
-        """
-        Projects Nx3 points using the camera parameters.
-        points_3d shape: (N, 1, 3) or (N, 3)
-        Returns shape (N, 2).
-        """
-        if len(points_3d.shape) == 2:
-            points_3d = points_3d.reshape(-1, 1, 3)
-
-        # Use OpenCV to project with current intrinsics/distortion.
-        # Note: we must convert rvec/tvec to float64, same for self.matrix and self.dist.
-        proj_2d, _ = cv2.projectPoints(
-            points_3d,
-            self.rvec.astype(np.float64),
-            self.tvec.astype(np.float64),
-            self.matrix.astype(np.float64),
-            self.dist.astype(np.float64),
-        )
-        return proj_2d.reshape(-1, 2)
 
     def reprojection_error(self, p3d, p2d):
         proj = self.project(p3d).reshape(p2d.shape)
@@ -2080,641 +2004,60 @@ class CameraGroup:
         for cam in self.cameras:
             cam.resize_camera(scale)
 
-def _pack_params(camera_network, points_3d, optimize_intrinsics):
-    """
-    Create the initial parameter vector from (cameras + 3D points).
-    If optimize_intrinsics=True, each camera has 16 parameters.
-    Otherwise, 6.
-    """
-    n_cams = len(camera_network.cameras)
-    T, K, _ = points_3d.shape  # 3D shape: (Time, Keypoints, 3)
 
-    all_cam_params = []
-    for cam in camera_network.cameras:
-        p = cam.get_params(optimize_intrinsics=optimize_intrinsics)
-        all_cam_params.append(p)
-
-    cam_params_concat = np.concatenate(all_cam_params)
-    n_cam_params = len(all_cam_params[0])  # either 6 or 16, typically
-
-    # Flatten the 3D points: shape = (T*K, 3)
-    p3d_flat = points_3d.reshape(-1, 3)
-
-    # Concatenate into x0
-    x0 = np.concatenate([cam_params_concat, p3d_flat.ravel()])
-    return x0, n_cam_params
-
-def _unpack_params(x_opt, camera_network, n_cam_params, optimize_intrinsics):
-    """
-    Extract camera parameters + 3D points from x_opt.
-    Update camera_network in-place with new camera parameters.
-    Return the new 3D points as (T, K, 3).
-    """
-    n_cams = len(camera_network.cameras)
-
-    # Update each camera
-    for i, cam in enumerate(camera_network.cameras):
-        start = i * n_cam_params
-        end = (i+1) * n_cam_params
-        cam.set_params(x_opt[start:end], optimize_intrinsics=optimize_intrinsics)
-
-    # The remainder is the 3D points
-    offset = n_cams * n_cam_params
-    # figure out how many 3D points are in the parameter vector
-    # you might store T, K somewhere or pass them in
-    # For example, let's assume you store them in camera_network for simplicity
-    T, K = camera_network._shape_3d  # or pass them in another way
-    p3d_size = T * K * 3
-    p3d_flat = x_opt[offset : offset + p3d_size]
-    p3d_new = p3d_flat.reshape((T, K, 3))
-    return p3d_new
-
-
-
-def bundle_adjust_with_weighted(
-    camera_network,
-    points_2d,
-    init_points_3d,
-    weights=None,
-    optimize_intrinsics=True,
-    max_nfev=100,
-    ftol=1e-4,
-    verbose=True, 
-    loss="linear" 
+def bundle_adjust_weighted(
+    camera_network, 
+    points_2d, 
+    init_points_3d, 
+    undistort=True, 
+    weights=None, 
 ):
     """
-    Extended bundle adjustment that can also optimize intrinsics + distortion if optimize_intrinsics=True.
+    points_2d is of shape (Cameras, Timepoints, Keypoints, 2)
+    init_points_3d is of shape (Timepoints, Keypoints, 3)
+    weights is of shape (Cameras, Timepoints, Keypoints). 
 
-    Parameters
-    ----------
-    camera_network : CameraGroup
-        Has cameras, each must implement get_params(...) and set_params(...).
-    points_2d : np.ndarray of shape (C, T, K, 2)
-        The 2D observations for each camera (C cameras, T frames, K keypoints).
-        Missing data can be NaN.
-    init_points_3d : np.ndarray of shape (T, K, 3)
-        Initial guess for the 3D points.
-    weights : np.ndarray or None, shape (C, T, K)
-        Weight for each measurement. If None, all are 1.0.
-    optimize_intrinsics : bool
-        If True, we use 16 parameters per camera (extrinsics + intrinsics + 5 distortion).
-        If False, only 6 extrinsics per camera are optimized.
-    max_nfev : int
-        Maximum iterations for the solver.
-    ftol : float
-        Tolerance for cost change termination.
-    verbose : bool
-        Print solver output.
-
-    Returns
-    -------
-    p3d_opt : np.ndarray, shape (T, K, 3)
-        The refined 3D points.
-    camera_network : CameraGroup
-        Cameras updated in-place with refined extrinsics (and possibly intrinsics).
+    Functionality will be: 
+    Code to set up the initial parameters for the optimization: camera parameters and init_3d_points. 
+    Code to set up the sparsity pattern of the jacobian. 
     """
 
-    # shape checks
-    C, T, K, _ = points_2d.shape
-    assert init_points_3d.shape == (T, K, 3), "Mismatch in 3D shape."
+    # Set up parameters
+    # TBD
 
-    # If you want, undistort the points here or handle that separately.
-
-    # Build a mask of valid points
-    mask_valid = ~np.isnan(points_2d[..., 0])
-
-    # Make points to zero which are nan, but make the corresponding weight to zero. 
-    nan_mask_points_3d = np.isnan(init_points_3d)
-    init_points_3d, weights = fix_init_points_and_weights(init_points_3d, weights)
-
-    # Pack initial param vector
-    x0, n_cam_params = _pack_params(camera_network, init_points_3d, optimize_intrinsics)
-
-    # For convenience, store T,K in the camera_network so fun(...) can retrieve them
-    camera_network._shape_3d = (T, K)
-
-    # Build the Jacobian sparsity pattern
-    jac_sparsity = make_jac_sparsity(points_2d, mask_valid, n_cam_params)
-
-    # Solve
+    # Do the optimization
     res = optimize.least_squares(
-        fun=fun, 
-        x0=x0,
-        jac_sparsity=jac_sparsity,
-        method="trf",
-        verbose=2 if verbose else 0,
+        fun,
+        x0,
+        jac_sparsity=A,
+        verbose=2,
         x_scale="jac",
-        ftol=ftol,
-        loss=loss,
-        max_nfev=max_nfev,
-        args=(camera_network, points_2d, weights, n_cam_params, optimize_intrinsics, mask_valid), 
-        bounds=(-np.inf, np.inf),
+        ftol=1e-4,
+        method="trf",
+        args=(
+
+        ),
+        max_nfev=100,
     )
 
-    # Unpack final parameters
-    x_opt = res.x
-    p3d_opt = _unpack_params(x_opt, camera_network, n_cam_params, optimize_intrinsics)
-    p3d_opt[nan_mask_points_3d] = np.nan
-    return p3d_opt, camera_network
+    points_3d_adjusted = np.copy(init_points_3d)
 
-# @jit(forceobj=True, parallel=True)
+    return points_3d_adjusted
+
 def fun(
     x,
-    camera_network,
-    points_2d,
-    weights,
-    n_cam_params,
-    optimize_intrinsics,
-    mask_valid
 ):
     """
-    Weighted reprojection residuals. Each valid 2D measurement yields 2 residuals.
+    Compute the residuals for the bundle adjustment.
     """
-    
-    n_cams = len(camera_network.cameras)
-    T, K = camera_network._shape_3d  # or pass them in explicitly
 
-    # 1) Update the camera parameters from x
-    for i, cam in enumerate(camera_network.cameras):
-        start = i * n_cam_params
-        end = (i+1) * n_cam_params
-        cam.set_params(x[start:end], optimize_intrinsics=optimize_intrinsics)
+    # Set up the camera parameters
+    # TBD
 
-    # 2) Extract 3D points
-    offset = n_cams * n_cam_params
-    p3d_size = T * K * 3
-    p3d_flat = x[offset : offset + p3d_size].reshape((T*K, 3))
+    # Set up the 3D points
+    # TBD
 
-    # 3) Build residuals
-    # shape of points_2d: (C, T, K, 2)
-    residuals = []
+    # Compute the residuals
+    # TBD
 
-    for c in range(n_cams):
-        cam = camera_network.cameras[c]
-        for t in range(T):
-            for k in range(K):
-                if not mask_valid[c, t, k]:
-                    continue
-                idx_3d = t*K + k
-                observed_2d = points_2d[c, t, k]
-
-                # Project
-                # shape = (1, 3)
-                X = p3d_flat[idx_3d].reshape(1, 3)
-                proj_2d = cam.project(X).ravel()  # shape (2,)
-
-                # Weight
-                w = 1.0
-                if weights is not None:
-                    w = weights[c, t, k]
-                    if np.isnan(w):
-                        w = 0.0
-
-                # Weighted residual
-                rx = w * (observed_2d[0] - proj_2d[0])
-                ry = w * (observed_2d[1] - proj_2d[1])
-                residuals.append(rx)
-                residuals.append(ry)
-
-    return np.array(residuals, dtype=np.float64)
-
-def make_jac_sparsity(points_2d, mask_valid, n_cam_params):
-    """
-    Construct a sparse Jacobian pattern.
-    For each valid measurement:
-      - 2 residual rows
-      - depends on n_cam_params columns for that camera
-      - depends on 3 columns for that point
-    """
-    C, T, K, _ = points_2d.shape
-    valid_count = np.sum(mask_valid)
-    # total rows = valid_count * 2
-    n_rows = valid_count * 2
-
-    # total cameras = C
-    # each camera has n_cam_params
-    # total 3D points = T*K
-    # each point has 3 params => total 3D param = 3 * T*K
-    n_cam_total = C * n_cam_params
-    n_points_total = T*K*3
-    n_params = n_cam_total + n_points_total
-
-    A = dok_matrix((n_rows, n_params), dtype=np.uint8)
-
-    row_ptr = 0
-
-    for c in range(C):
-        for t in range(T):
-            for k in range(K):
-                if not mask_valid[c, t, k]:
-                    continue
-
-                # 2 residual rows
-                r1 = row_ptr
-                r2 = row_ptr + 1
-                row_ptr += 2
-
-                # camera block
-                cam_start = c*n_cam_params
-                cam_end = cam_start + n_cam_params
-                # mark columns for [cam_start : cam_end] as 1
-                for col in range(cam_start, cam_end):
-                    A[r1, col] = 1
-                    A[r2, col] = 1
-
-                # 3D block
-                p_idx = t*K + k
-                pt_start = n_cam_total + p_idx*3
-                pt_end   = pt_start + 3
-                for col in range(pt_start, pt_end):
-                    A[r1, col] = 1
-                    A[r2, col] = 1
-
-    return A
-
-
-def fix_init_points_and_weights(init_points_3d, weights=None):
-    """
-    Replace any NaN 3D coordinates with zeros and set corresponding weights to zero.
-    
-    Parameters
-    ----------
-    init_points_3d : ndarray, shape (T, K, 3)
-        The initial guess for 3D points (time T, keypoints K).
-        Some may be NaN.
-    weights : ndarray or None, shape (C, T, K), optional
-        The per-camera weights for each 3D point. 
-        If provided, the weights for any NaN 3D point get set to 0 for all cameras.
-
-    Returns
-    -------
-    init_points_3d_fixed : ndarray, shape (T, K, 3)
-        A copy of init_points_3d with NaNs replaced by 0.0
-    weights_fixed : ndarray or None, shape (C, T, K)
-        A copy of weights with zeros set for points that were NaN in init_points_3d.
-        If weights was None, returns None.
-    """
-    # Make copies so we don't modify the originals in-place
-    init_points_3d_fixed = np.copy(init_points_3d)
-    weights_fixed = None if weights is None else np.copy(weights)
-
-    # Find which (T,K) have NaN in any coordinate
-    # shape: (T, K)
-    nan_mask = np.isnan(init_points_3d_fixed[..., 0]) | \
-               np.isnan(init_points_3d_fixed[..., 1]) | \
-               np.isnan(init_points_3d_fixed[..., 2])
-
-    # Replace NaNs in 3D with zeros
-    init_points_3d_fixed[np.isnan(init_points_3d_fixed)] = 0.0
-
-    # If we have a weights array, set those entries to 0
-    if weights_fixed is not None:
-        # weights_fixed has shape (C, T, K)
-        # We want to set weights_fixed[:, t, k] = 0 for each (t,k) that was NaN
-        T, K, _ = init_points_3d.shape
-        C = weights_fixed.shape[0]
-
-        for t in range(T):
-            for k in range(K):
-                if nan_mask[t, k]:
-                    weights_fixed[:, t, k] = 0.0
-
-    return init_points_3d_fixed, weights_fixed
-
-
-def bundle_adjust_with_smoothness(
-    camera_network,
-    points_2d,
-    init_points_3d,
-    weights=None,
-    optimize_intrinsics=True,
-    smoothness_weight=None,
-    smoothness_derivative="first",
-    max_nfev=100,
-    ftol=1e-4,
-    verbose=True,
-    loss="linear",
-):
-    """
-    Perform bundle adjustment with an optional temporal smoothness penalty on 3D points.
-    
-    Parameters
-    ----------
-    camera_network : CameraGroup
-        Contains cameras, each with get_params and set_params.
-    points_2d : np.ndarray of shape (C, T, K, 2)
-        The 2D observations for each camera (C cameras, T frames, K keypoints).
-        Possibly containing NaNs for missing data.
-    init_points_3d : np.ndarray of shape (T, K, 3)
-        Initial guess for the 3D points over time (T) and keypoints (K).
-    weights : np.ndarray or None, shape (C, T, K), optional
-        Per-measurement confidence weights. If None, all are 1.
-    optimize_intrinsics : bool
-        If True, each camera has 16 parameters: extrinsics(6) + intrinsics(5) + distortion(5).
-        If False, each camera has 6 parameters (extrinsics only).
-    smoothness_weight : float or None
-        If None, no smoothness penalty. If a float, we penalize frame-to-frame differences 
-        (1st derivative) or acceleration (2nd derivative) in 3D.
-    smoothness_derivative : str
-        Either "first" or "second". Controls whether we do velocity or acceleration smoothing.
-    max_nfev : int
-        Max solver iterations.
-    ftol : float
-        Tolerance for cost function termination.
-    verbose : bool
-        If True, prints solver progress.
-    loss : str
-        SciPy’s robust loss type ("linear", "soft_l1", "huber", etc.).
-
-    Returns
-    -------
-    p3d_opt : np.ndarray, shape (T, K, 3)
-        Refined 3D points after BA.
-    camera_network : CameraGroup
-        The same camera group with updated parameters.
-    """
-    C, T, K, _ = points_2d.shape
-    assert init_points_3d.shape == (T, K, 3), "init_points_3d shape mismatch"
-
-    # 1) Identify valid 2D
-    mask_valid = ~np.isnan(points_2d[..., 0])
-
-    # 2) Fix up any NaNs in 3D and weights
-    init_points_3d_fixed, weights_fixed = fix_init_points_and_weights(init_points_3d, weights)
-
-    # 3) Build x0 (camera + 3D)
-    x0, n_cam_params = _pack_params(camera_network, init_points_3d_fixed, optimize_intrinsics)
-
-    # 4) Store shape so the residual function can see T,K
-    camera_network._shape_3d = (T, K)
-
-    # 5) Build standard reprojection sparsity
-    jac_sparsity = make_jac_sparsity_with_smoothness(
-        points_2d,
-        mask_valid,
-        n_cam_params,
-        smoothness_weight,
-        smoothness_derivative,
-        T,
-        K
-    )
-    # For advanced usage, you could also expand jac_sparsity to reflect smoothness terms,
-    # but for simplicity we'll skip that here.
-
-    # 6) Solve
-    res = optimize.least_squares(
-        fun=fun_with_smoothness,
-        x0=x0,
-        jac_sparsity=jac_sparsity,
-        method="trf",
-        verbose=2 if verbose else 0,
-        x_scale="jac",
-        ftol=ftol,
-        loss=loss,
-        max_nfev=max_nfev,
-        bounds=(-np.inf, np.inf),
-        args=(
-            camera_network,
-            points_2d,
-            weights_fixed,
-            n_cam_params,
-            optimize_intrinsics,
-            mask_valid,
-            smoothness_weight,
-            smoothness_derivative,
-        ),
-    )
-
-    # 7) Unpack final params
-    x_opt = res.x
-    p3d_opt = _unpack_params(x_opt, camera_network, n_cam_params, optimize_intrinsics)
-
-    # Restore original NaNs in final 3D
-    p3d_opt[np.isnan(init_points_3d)] = np.nan
-
-    return p3d_opt, camera_network
-
-
-def fun_with_smoothness(
-    x,
-    camera_network,
-    points_2d,
-    weights,
-    n_cam_params,
-    optimize_intrinsics,
-    mask_valid,
-    smoothness_weight,
-    smoothness_derivative
-):
-    """
-    1) Standard weighted reprojection residual.
-    2) Optional temporal smoothness penalty for consecutive frames (1st or 2nd derivative).
-    """
-    n_cams = len(camera_network.cameras)
-    T, K = camera_network._shape_3d
-
-    # -- 1) Update cameras --
-    for i, cam in enumerate(camera_network.cameras):
-        start = i * n_cam_params
-        end = (i+1) * n_cam_params
-        cam.set_params(x[start:end], optimize_intrinsics=optimize_intrinsics)
-
-    # -- 2) Extract 3D from x --
-    offset = n_cams * n_cam_params
-    p3d_size = T*K*3
-    p3d_flat = x[offset : offset + p3d_size].reshape((T*K, 3))
-    p3d_matrix = p3d_flat.reshape(T, K, 3)
-
-    # -- 3) Weighted reprojection residual (as in 'fun') --
-    residuals = []
-    for c in range(n_cams):
-        cam = camera_network.cameras[c]
-        for t in range(T):
-            for k in range(K):
-                if not mask_valid[c, t, k]:
-                    continue
-                idx_3d = t*K + k
-                obs_2d = points_2d[c, t, k]
-                proj_2d = cam.project(p3d_flat[idx_3d].reshape(1, 3)).ravel()
-
-                # Weighted
-                w = 1.0
-                if weights is not None:
-                    w = weights[c, t, k]
-                    if np.isnan(w):
-                        w = 0.0
-
-                rx = w * (obs_2d[0] - proj_2d[0])
-                ry = w * (obs_2d[1] - proj_2d[1])
-                residuals.append(rx)
-                residuals.append(ry)
-
-    # -- 4) Smoothness penalty if requested --
-    # skip if smoothness_weight is None or ~> 0
-    if (smoothness_weight is not None) and (smoothness_weight > 1e-12):
-        sqrt_sw = np.sqrt(smoothness_weight)
-
-        if smoothness_derivative.lower() == "first":
-            # p3d_matrix[t+1,k] - p3d_matrix[t,k]
-            for t in range(T-1):
-                for k in range(K):
-                    # skip if either frame is NaN in 3D
-                    if np.any(np.isnan(p3d_matrix[t, k])) or np.any(np.isnan(p3d_matrix[t+1, k])):
-                        continue
-                    diff = p3d_matrix[t+1, k] - p3d_matrix[t, k]
-                    # Weighted by sqrt_sw
-                    residuals.append(sqrt_sw * diff[0])
-                    residuals.append(sqrt_sw * diff[1])
-                    residuals.append(sqrt_sw * diff[2])
-
-        elif smoothness_derivative.lower() == "second":
-            # p3d_matrix[t+2,k] - 2*p3d_matrix[t+1,k] + p3d_matrix[t,k]
-            for t in range(T-2):
-                for k in range(K):
-                    if (np.any(np.isnan(p3d_matrix[t, k])) or 
-                        np.any(np.isnan(p3d_matrix[t+1, k])) or
-                        np.any(np.isnan(p3d_matrix[t+2, k]))):
-                        continue
-                    accel = p3d_matrix[t+2, k] - 2*p3d_matrix[t+1, k] + p3d_matrix[t, k]
-                    residuals.append(sqrt_sw * accel[0])
-                    residuals.append(sqrt_sw * accel[1])
-                    residuals.append(sqrt_sw * accel[2])
-
-        # else: if user gave something else, ignore or raise an error
-
-    # Return the final array
-    return np.array(residuals, dtype=np.float64)
-
-
-def make_jac_sparsity_with_smoothness(points_2d, mask_valid, n_cam_params,
-                                      smoothness_weight, smoothness_derivative,
-                                      T, K):
-    """
-    Like make_jac_sparsity, but we add extra rows for each temporal smoothness term.
-
-    We assume:
-    - points_2d shape = (C, T, K, 2)
-    - 'mask_valid' is shape = (C, T, K)
-    - 'n_cam_params' is # of camera params (6 or 16)
-    - 'smoothness_weight' might be None or a float
-    - 'smoothness_derivative' in ['first','second']
-    - T, K are the #frames, #keypoints
-
-    Returns
-    -------
-    A dok_matrix that has (#reproj_rows + #smoothness_rows) x (#camera_params + #3D_params).
-    """
-    # 1) Build the standard reprojection pattern:
-    A_reproj = make_jac_sparsity(points_2d, mask_valid, n_cam_params)
-    n_reproj_rows, n_params = A_reproj.shape
-
-    # 2) If no smoothness, just return the standard version
-    if smoothness_weight is None or smoothness_weight <= 1e-12:
-        return A_reproj
-
-    # 3) Count how many new rows we need for smoothness
-    # e.g. for 'first' derivative, we have (T-1)*K * 3 additional rows
-    if smoothness_derivative.lower() == "first":
-        n_smooth_rows = (T - 1) * K * 3
-    elif smoothness_derivative.lower() == "second":
-        n_smooth_rows = (T - 2) * K * 3
-    else:
-        # If user gave something else, skip
-        n_smooth_rows = 0
-
-    # 4) Create a bigger DOK matrix for total rows
-    A = dok_matrix((n_reproj_rows + n_smooth_rows, n_params), dtype=np.uint8)
-
-    # 5) Copy the reprojection pattern into the top
-    for (r, c), val in A_reproj.items():
-        A[r, c] = val
-
-    # 6) Now fill in the smoothness rows
-    row_ptr = n_reproj_rows  # start adding new rows after reprojection
-    sqrt_sw = np.sqrt(smoothness_weight)  # you won't actually store this, but indexing
-
-    # We'll only need to mark 3D dependencies. The camera parameters do NOT matter for smoothness 
-    # because the derivative constraints only depend on the 3D point coordinates.
-    # So we do not set anything for columns in [0 : n_cams * n_cam_params].
-    # The 3D block starts at 'cam_offset = C * n_cam_params'.
-
-    # If you keep T,K in the camera group, you might not need them as function args.
-    # We'll just assume T,K are known here.
-    # index for 3D block
-    # The total # 3D points = T*K, each has 3 coords => T*K*3
-    n_cams = points_2d.shape[0]
-    cam_offset = n_cams * n_cam_params
-
-    # We'll do "first" derivative as an example:
-    if smoothness_derivative.lower() == "first":
-        for t in range(T-1):
-            for k in range(K):
-                # The row depends on p3d_matrix[t+1, k] and p3d_matrix[t, k].
-                # That's 2 sets of x,y,z => 6 parameter columns total.
-                # Each difference is 3 residuals (x,y,z).
-                # We add 3 new rows in the matrix for them.
-
-                # row for x, y, z
-                # row_x = row_ptr
-                # row_y = row_ptr + 1
-                # row_z = row_ptr + 2
-                # but we only need to mark columns with 1, not the smoothness_weight
-
-                # 3D index => p_idx = t*K + k
-                p_idxA = t*K + k
-                p_idxB = (t+1)*K + k
-
-                # The columns for p_idxA: (cam_offset + p_idxA*3) to (cam_offset + p_idxA*3 + 2)
-                colA = cam_offset + p_idxA*3
-                colB = cam_offset + p_idxB*3
-
-                # Now set A[row_x, colA + 0] = 1 => dx/dx
-                # But the difference is: p[t+1] - p[t].
-                # That means the partial derivative w.r.t. each coordinate is +1 for p[t+1], -1 for p[t].
-                # So we might store a +1 and -1. But since this code uses a binary pattern (1 = potentially non-zero),
-                # it might suffice to set them to 1 or 2. Because the solver only wants to know "non-zero or zero?" 
-                # There's no way to store negative 1 in the DOK pattern for jac_sparsity.
-
-                # We'll just store 1 for each coordinate that is relevant, because "non-zero" is all that matters.
-                # row_x
-                A[row_ptr, colA + 0] = 1   # depends on p[t, k].x
-                A[row_ptr, colB + 0] = 1   # depends on p[t+1, k].x
-
-                # row_y
-                A[row_ptr + 1, colA + 1] = 1
-                A[row_ptr + 1, colB + 1] = 1
-
-                # row_z
-                A[row_ptr + 2, colA + 2] = 1
-                A[row_ptr + 2, colB + 2] = 1
-
-                row_ptr += 3
-
-    elif smoothness_derivative.lower() == "second":
-        # p[t+2] - 2p[t+1] + p[t], similarly each difference => 3 rows
-        for t in range(T-2):
-            for k in range(K):
-                p_idxA = t*K + k       # p[t]
-                p_idxB = (t+1)*K + k   # p[t+1]
-                p_idxC = (t+2)*K + k   # p[t+2]
-
-                colA = cam_offset + p_idxA*3
-                colB = cam_offset + p_idxB*3
-                colC = cam_offset + p_idxC*3
-
-                # row_x
-                A[row_ptr,   colA + 0] = 1
-                A[row_ptr,   colB + 0] = 1
-                A[row_ptr,   colC + 0] = 1
-                # row_y
-                A[row_ptr+1, colA + 1] = 1
-                A[row_ptr+1, colB + 1] = 1
-                A[row_ptr+1, colC + 1] = 1
-                # row_z
-                A[row_ptr+2, colA + 2] = 1
-                A[row_ptr+2, colB + 2] = 1
-                A[row_ptr+2, colC + 2] = 1
-
-                row_ptr += 3
-
-    return A
+    return residuals
